@@ -1,0 +1,7 @@
+path: C:/Users/ASUS/OneDrive/Desktop/project_td/data/labels/yolo
+train: train/images
+val: val/images
+test: test/images
+
+nc: 9
+names: ['luminous_product', 'dent', 'scratch', 'crack', 'corrosion', 'leak', 'packaging_damage', 'terminal_damage', 'label_damage']

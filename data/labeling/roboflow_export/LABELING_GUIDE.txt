@@ -1,0 +1,7 @@
+Roboflow/CVAT labeling guide
+----------------------------
+Classes: dent, scratch, crack, corrosion, leak, packaging_damage, terminal_damage, label_damage, luminous_product
+1. Upload images/ to Roboflow project
+2. Draw bounding boxes per damage region
+3. Export YOLOv8 format -> data/labels/yolo/
+4. Run: python scripts/run_phase3_train.py

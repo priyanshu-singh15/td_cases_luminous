@@ -1,0 +1,17 @@
+{
+  "path": "C:\\Users\\ASUS\\OneDrive\\Desktop\\project_td\\data\\labeling\\roboflow_export",
+  "train": "images",
+  "val": "images",
+  "names": {
+    "0": "dent",
+    "1": "scratch",
+    "2": "crack",
+    "3": "corrosion",
+    "4": "leak",
+    "5": "packaging_damage",
+    "6": "terminal_damage",
+    "7": "label_damage",
+    "8": "luminous_product"
+  },
+  "note": "Annotate in Roboflow or CVAT, then import labels to data/labels/yolo/"
+}

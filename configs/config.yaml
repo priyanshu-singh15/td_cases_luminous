@@ -1,0 +1,71 @@
+project:
+  name: luminous_td_damage
+  seed: 42
+
+paths:
+  raw_upload: UploadTdcaseDocuments
+  data_root: data
+  models_dir: models
+  outputs_dir: outputs
+  cases_db: outputs/cases/history.jsonl
+
+damage_classes:
+  - dent
+  - scratch
+  - crack
+  - corrosion
+  - leak
+  - packaging_damage
+  - terminal_damage
+  - label_damage
+
+severity_classes:
+  - Mild
+  - Moderate
+  - Severe
+
+product_class: luminous_product
+
+detector:
+  model_size: yolov8m
+  imgsz: 640
+  epochs: 80
+  batch: 16
+  conf_train: 0.25
+  patience: 15
+
+severity:
+  backbone: efficientnet-b0
+  input_size: 224
+  epochs: 40
+  batch: 32
+  lr: 0.0003
+
+inference:
+  conf_threshold: 0.35
+  iou_threshold: 0.45
+  human_review_threshold: 0.55
+  min_blur_variance: 80.0
+  min_resolution: 320
+
+augmentation:
+  hsv_h: 0.02
+  hsv_s: 0.6
+  hsv_v: 0.5
+  degrees: 12
+  translate: 0.12
+  scale: 0.45
+  shear: 2.0
+  perspective: 0.0008
+  flipud: 0.0
+  fliplr: 0.5
+  mosaic: 1.0
+  mixup: 0.1
+  copy_paste: 0.05
+
+api:
+  host: 0.0.0.0
+  port: 8000
+
+dashboard:
+  api_url: http://127.0.0.1:8000
