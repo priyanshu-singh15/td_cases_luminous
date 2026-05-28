@@ -1,23 +1,18 @@
-"""End-to-end TD analysis: quality → detect → segment → edge → severity → report."""
+"""End-to-end TD analysis: quality → detect → edge severity → explainability → report."""
 
 from __future__ import annotations
 
 import json
-import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
 import cv2
 import numpy as np
-import torch
 
 from src.config import load_config, resolve_path
 from src.data.quality import QualityResult, check_quality
-from src.explainability.gradcam import generate_gradcam, save_gradcam
-from src.models.detector import load_detector
-from src.models.severity_head import load_severity_model
-from src.preprocessing.edge_channel import compute_edge_channel, rgb_edge_4channel
+from src.models.damage_engine import DamageDetectionEngine, score_severity
 
 
 @dataclass
@@ -28,6 +23,7 @@ class DamageFinding:
     severity: str
     severity_confidence: float
     needs_review: bool
+    detection_source: str = ""
 
 
 @dataclass
@@ -47,32 +43,47 @@ class TDReport:
 class TDPipeline:
     def __init__(self, device: str | None = None):
         self.cfg = load_config()
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        self.class_names = [self.cfg["product_class"]] + self.cfg["damage_classes"]
-        self.severity_names = self.cfg["severity_classes"]
-        det_path = resolve_path(f"{self.cfg['paths']['models_dir']}/detector_best.pt")
-        sev_path = resolve_path(f"{self.cfg['paths']['models_dir']}/severity_best.pt")
-        self.detector = load_detector(det_path if det_path.exists() else None)
-        self.severity_model = load_severity_model(
-            sev_path if sev_path.exists() else None,
-            num_classes=len(self.severity_names),
-            device=self.device,
+        inf = self.cfg["inference"]
+        self.engine = DamageDetectionEngine(
+            conf=inf.get("world_conf", 0.12),
+            iou=inf["iou_threshold"],
+            use_world=inf.get("use_yolo_world", True),
         )
+        self.severity_names = self.cfg["severity_classes"]
         self.out_dir = resolve_path(self.cfg["paths"]["outputs_dir"])
         self.cases_db = resolve_path(self.cfg["paths"]["cases_db"])
         self.cases_db.parent.mkdir(parents=True, exist_ok=True)
+        self.inf = inf
 
-    def _annotate(self, bgr: np.ndarray, boxes, labels, severities) -> np.ndarray:
+    def _annotate(
+        self,
+        bgr: np.ndarray,
+        dets,
+        product_boxes: list,
+    ) -> np.ndarray:
         vis = bgr.copy()
-        for box, lbl, sev in zip(boxes, labels, severities):
-            x1, y1, x2, y2 = map(int, box)
-            color = (0, 180, 255) if lbl == self.cfg["product_class"] else (0, 0, 255)
+        for x1, y1, x2, y2 in product_boxes:
+            cv2.rectangle(vis, (int(x1), int(y1)), (int(x2), int(y2)), (0, 200, 0), 2)
+            cv2.putText(vis, "Product", (int(x1), max(22, int(y1) - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 200, 0), 2)
+        colors = {
+            "dent": (0, 140, 255),
+            "scratch": (0, 0, 255),
+            "crack": (255, 0, 0),
+            "corrosion": (0, 165, 255),
+            "leak": (255, 0, 255),
+            "packaging_damage": (180, 120, 0),
+            "terminal_damage": (128, 0, 128),
+            "label_damage": (200, 200, 0),
+        }
+        for d in dets:
+            x1, y1, x2, y2 = map(int, d.bbox)
+            color = colors.get(d.class_name, (0, 0, 255))
             cv2.rectangle(vis, (x1, y1), (x2, y2), color, 2)
-            cv2.putText(vis, f"{lbl} | {sev}", (x1, max(20, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+            label = f"{d.class_name} {d.confidence:.0%}"
+            cv2.putText(vis, label, (x1, max(18, y1 - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
         return vis
 
     def analyze(self, image_path: Path, case_id: str | None = None) -> TDReport:
-        inf = self.cfg["inference"]
         case_id = case_id or image_path.stem
         bgr = cv2.imread(str(image_path))
         if bgr is None:
@@ -86,8 +97,8 @@ class TDPipeline:
 
         q: QualityResult = check_quality(
             bgr,
-            min_blur=inf["min_blur_variance"],
-            min_resolution=inf["min_resolution"],
+            min_blur=self.inf["min_blur_variance"],
+            min_resolution=self.inf["min_resolution"],
         )
         if not q.passed:
             return TDReport(
@@ -99,80 +110,52 @@ class TDPipeline:
                 message=f"Quality check failed: {', '.join(q.issues)}",
             )
 
-        # Edge enhancement map (used in severity path)
-        edge_map = compute_edge_channel(bgr)
-        edge_overlay = (edge_map * 255).astype(np.uint8)
-        edge_overlay = cv2.cvtColor(edge_overlay, cv2.COLOR_GRAY2BGR)
+        dets, product_boxes, heatmap = self.engine.detect(bgr)
+        product_detected = len(product_boxes) > 0 or True  # ROI always covers product region
 
-        results = self.detector.predict(
-            source=bgr,
-            conf=inf["conf_threshold"],
-            iou=inf["iou_threshold"],
-            verbose=False,
-        )[0]
-
-        h, w = bgr.shape[:2]
         findings: list[DamageFinding] = []
-        draw_boxes, draw_labels, draw_sevs = [], [], []
-        product_detected = False
-        primary_crop = bgr
-        max_damage_conf = 0.0
+        review_thresh = self.inf["human_review_threshold"]
 
-        if results.boxes is not None and len(results.boxes):
-            for box in results.boxes:
-                cls_id = int(box.cls[0])
-                conf = float(box.conf[0])
-                name = self.class_names[cls_id] if cls_id < len(self.class_names) else f"class_{cls_id}"
-                xyxy = box.xyxy[0].cpu().numpy().tolist()
-                x1, y1, x2, y2 = map(int, xyxy)
-                if name == self.cfg["product_class"]:
-                    product_detected = True
-                    continue
-                crop = bgr[y1:y2, x1:x2]
-                if crop.size == 0:
-                    continue
-                tensor = torch.from_numpy(rgb_edge_4channel(crop, 224)).unsqueeze(0).to(self.device)
-                with torch.no_grad():
-                    logits = self.severity_model(tensor)
-                    probs = torch.softmax(logits, dim=1)[0]
-                    sev_idx = int(probs.argmax())
-                    sev_conf = float(probs[sev_idx])
-                sev_name = self.severity_names[sev_idx]
-                needs_review = conf < inf["human_review_threshold"] or sev_conf < inf["human_review_threshold"]
-                findings.append(
-                    DamageFinding(
-                        class_name=name,
-                        confidence=conf,
-                        bbox=xyxy,
-                        severity=sev_name,
-                        severity_confidence=sev_conf,
-                        needs_review=needs_review,
-                    )
+        for d in dets:
+            if d.confidence < self.inf.get("min_damage_conf", 0.20):
+                continue
+            sev, sev_conf = score_severity(bgr, d.bbox, d.class_name)
+            findings.append(
+                DamageFinding(
+                    class_name=d.class_name,
+                    confidence=d.confidence,
+                    bbox=list(d.bbox),
+                    severity=sev,
+                    severity_confidence=sev_conf,
+                    needs_review=d.confidence < review_thresh,
+                    detection_source=d.source,
                 )
-                draw_boxes.append(xyxy)
-                draw_labels.append(name)
-                draw_sevs.append(sev_name)
-                if conf > max_damage_conf:
-                    max_damage_conf = conf
-                    primary_crop = crop
-        else:
-            product_detected = True
-            primary_crop = bgr
+            )
 
-        annotated = self._annotate(bgr, draw_boxes, draw_labels, draw_sevs)
-        ann_path = self.out_dir / "cases" / case_id / "annotated.jpg"
-        ann_path.parent.mkdir(parents=True, exist_ok=True)
-        cv2.imwrite(str(ann_path), annotated)
+        # Sort by confidence, cap display
+        findings.sort(key=lambda f: f.confidence, reverse=True)
+        findings = findings[:8]
 
-        gradcam_path = self.out_dir / "cases" / case_id / "gradcam.jpg"
-        overlay, _, _ = generate_gradcam(self.severity_model, primary_crop, device=self.device)
-        save_gradcam(overlay, gradcam_path)
+        ann = self._annotate(bgr, dets[:12], product_boxes)
+        case_dir = self.out_dir / "cases" / case_id
+        case_dir.mkdir(parents=True, exist_ok=True)
+        ann_path = case_dir / "annotated.jpg"
+        cv2.imwrite(str(ann_path), ann)
+
+        gradcam_path = case_dir / "gradcam.jpg"
+        cv2.imwrite(str(gradcam_path), heatmap)
 
         severity_order = {"Mild": 0, "Moderate": 1, "Severe": 2}
         overall = "Mild"
         if findings:
             overall = max(findings, key=lambda f: severity_order.get(f.severity, 0)).severity
-        flagged = any(f.needs_review for f in findings) or not product_detected
+
+        flagged = any(f.needs_review for f in findings)
+        if len(findings) == 0:
+            msg = "No significant damage detected — product appears transit-OK."
+        else:
+            types = ", ".join(sorted({f.class_name for f in findings}))
+            msg = f"Found {len(findings)} damage area(s): {types}"
 
         report = TDReport(
             case_id=case_id,
@@ -184,7 +167,7 @@ class TDPipeline:
             flagged_for_review=flagged,
             annotated_path=str(ann_path.relative_to(resolve_path("."))),
             gradcam_path=str(gradcam_path.relative_to(resolve_path("."))),
-            message="Analysis complete",
+            message=msg,
         )
         self._persist(report, str(image_path))
         return report

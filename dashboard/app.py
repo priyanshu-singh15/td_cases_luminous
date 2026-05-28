@@ -119,6 +119,7 @@ def _load_history() -> pd.DataFrame:
 # --- Page: Upload & Analyse ---
 if page == "Upload & Analyse":
     st.title("Upload & Analyse")
+    st.caption("Uses YOLO-World open-vocabulary AI + classical dent/scratch CV — no manual labels required.")
     online = _api_online()
     if online:
         st.success("Backend API is online.")
@@ -152,9 +153,18 @@ if page == "Upload & Analyse":
                     )
                     st.session_state["last_report"] = data
                     st.success(f"Case **{data['case_id']}** — **{data['overall_severity']}**")
+                    st.info(data.get("message", ""))
                     if data.get("flagged_for_review"):
-                        st.warning("Flagged for human review.")
-                    st.json(data)
+                        st.warning("Some regions have lower confidence — recommend human review.")
+                    cid = data["case_id"]
+                    ann = OUT / "cases" / cid / "annotated.jpg"
+                    cam = OUT / "cases" / cid / "gradcam.jpg"
+                    if ann.exists() and cam.exists():
+                        v1, v2 = st.columns(2)
+                        v1.image(Image.open(ann), caption="Damage boxes", use_container_width=True)
+                        v2.image(Image.open(cam), caption="Damage heatmap", use_container_width=True)
+                    with st.expander("Full JSON report"):
+                        st.json(data)
                 except Exception as e:
                     st.error(f"Analysis failed: {e}")
 
@@ -180,9 +190,11 @@ elif page == "Results Viewer":
         if report and report.get("case_id") == case_id:
             c3.markdown("### Findings")
             for f in report.get("findings", []):
+                src = f.get("detection_source", "")
                 c3.markdown(
                     f"- **{f['class_name']}** — {f['severity']} "
                     f"(conf {f['confidence']:.0%})"
+                    + (f" _{src}_" if src else "")
                 )
             if not report.get("findings"):
                 c3.write("No damage regions detected above threshold.")
