@@ -12,3 +12,12 @@
 *.gif
 *.webp
 *.bmp
+
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.bmp
+*.webp
+images/
+assets/
